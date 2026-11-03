@@ -4,6 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 
 const ROOT = __dirname;
@@ -133,6 +134,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id);
   CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at DESC);
 `);
+
+// Lightweight migrations for parity features added after phase 1.
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+ensureColumn('projects', 'music_asset_id', 'INTEGER');
+ensureColumn('scenes', 'ref_exact', 'INTEGER NOT NULL DEFAULT 0');
 
 const VOICES = {
   lily: { label: 'Lily (Mellow Saxophone)', engineId: 'avocado_v2:Lily' },
@@ -334,6 +343,186 @@ function getScene(id) {
   return db.prepare('SELECT * FROM scenes WHERE id = ?').get(id);
 }
 
+function parseStoryboard(text) {
+  const raw = String(text || '').replace(/\r\n/g, '\n');
+  const lines = raw.split('\n');
+  const markerRe = /^\s*(?:cảnh|scene|shot|khung|phân cảnh)\s*(\d+)\s*[:.\-]?\s*(.*)$/i;
+  const numberedRe = /^\s*(\d{1,2})[.)]\s+(.*)$/;
+  const blocks = [];
+  let current = null;
+  for (const line of lines) {
+    const marker = line.match(markerRe);
+    const numbered = !marker ? line.match(numberedRe) : null;
+    if (marker || numbered) {
+      if (current) blocks.push(current);
+      current = { title: (marker ? marker[2] : numbered[2] || '').trim(), lines: [] };
+    } else if (current) {
+      current.lines.push(line);
+    } else if (line.trim()) {
+      current = { title: '', lines: [line] };
+    }
+  }
+  if (current) blocks.push(current);
+  let sceneBlocks = blocks;
+  if (sceneBlocks.length <= 1) {
+    const byBlank = raw.split(/\n\s*\n/).map((chunk) => chunk.trim()).filter(Boolean);
+    if (byBlank.length > 1) sceneBlocks = byBlank.map((chunk) => ({ title: '', lines: chunk.split('\n') }));
+  }
+  return sceneBlocks.map((block, idx) => {
+    const bodyLines = (block.lines || []).map((line) => line.trim()).filter(Boolean);
+    let duration = 5;
+    let voiceover = '';
+    let overlay = '';
+    const promptLines = [];
+    for (const line of [...(block.title ? [block.title] : []), ...bodyLines]) {
+      const dm = line.match(/(\d+(?:[.,]\d+)?)\s*(giây|sec|secs|s)\b/i);
+      if (dm) { duration = Math.min(120, Math.max(1, parseFloat(dm[1].replace(',', '.')))); break; }
+    }
+    for (const line of bodyLines) {
+      const vo = line.match(/^(?:lời thoại|voiceover|vo|thoại)\s*[:：]\s*(.+)$/i);
+      const ov = line.match(/^(?:chữ|overlay|text|đồ họa|chữ đồ họa)\s*[:：]\s*(.+)$/i);
+      if (vo) voiceover = vo[1].trim();
+      else if (ov) overlay = ov[1].trim();
+      else promptLines.push(line);
+    }
+    if (!voiceover) {
+      const quoted = bodyLines.join(' ').match(/[“"]([^”"]{10,})[”"]/);
+      if (quoted) voiceover = quoted[1].trim();
+    }
+    return {
+      title: block.title && block.title.length <= 120 ? block.title : `Cảnh ${idx + 1}`,
+      durationSec: duration,
+      prompt: promptLines.join('\n'),
+      voiceover,
+      overlay
+    };
+  }).filter((scene) => scene.prompt || scene.voiceover || scene.title);
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile('ffmpeg', args, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(String(stderr || error.message).slice(-800)));
+      else resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function processStitchJob(jobId) {
+  const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+  if (!job || job.kind !== 'stitch') return;
+  const setJob = (status, result, error) => db.prepare('UPDATE jobs SET status = ?, result_json = ?, error = ?, updated_at = ? WHERE id = ?')
+    .run(status, result ? JSON.stringify(result) : null, error || null, now(), jobId);
+  setJob('running', { message: 'Worker FFmpeg đang ghép video.' }, null);
+  const project = getProjectRow(job.project_id);
+  const scenes = db.prepare('SELECT * FROM scenes WHERE project_id = ? ORDER BY position ASC, id ASC').all(job.project_id);
+  const assetById = (id) => id ? db.prepare('SELECT * FROM assets WHERE id = ?').get(id) : null;
+  const dims = { '16:9': [1280, 720], '9:16': [720, 1280], '1:1': [960, 960] }[project.format] || [1280, 720];
+  const [width, height] = dims;
+  const transition = Math.max(0, Number(project.transition_sec) || 0);
+  const tmpDir = path.join(DATA_DIR, 'tmp', `job-${jobId}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  try {
+    const normPaths = [];
+    for (let i = 0; i < scenes.length; i++) {
+      const scene = scenes[i];
+      const clip = assetById(scene.video_asset_id);
+      if (!clip) throw new Error(`Cảnh "${scene.title}" chưa có clip.`);
+      const src = path.join(MEDIA_DIR, clip.storage_path);
+      const out = path.join(tmpDir, `norm-${i}.mp4`);
+      await runFfmpeg(['-y', '-stream_loop', '-1', '-i', src,
+        '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,fps=30,format=yuv420p`,
+        '-t', String(scene.duration_sec), '-an', '-c:v', 'libx264', '-preset', 'veryfast', out]);
+      normPaths.push(out);
+    }
+    const durations = scenes.map((scene) => Number(scene.duration_sec));
+    const totalDuration = durations.reduce((a, b) => a + b, 0) - transition * (scenes.length - 1);
+    const useXfade = transition > 0 && scenes.length > 1 && durations.every((d) => d > transition);
+    const inputs = [];
+    normPaths.forEach((p) => inputs.push('-i', p));
+    const filters = [];
+    let videoLabel = '0:v';
+    if (scenes.length > 1 && useXfade) {
+      let acc = durations[0];
+      let currentLabel = '0:v';
+      for (let k = 1; k < scenes.length; k++) {
+        const offset = Math.max(0, acc - transition);
+        const outLabel = `v${k}`;
+        filters.push(`[${currentLabel}][${k}:v]xfade=transition=fade:duration=${transition}:offset=${offset}[${outLabel}]`);
+        acc = acc + durations[k] - transition;
+        currentLabel = outLabel;
+      }
+      videoLabel = currentLabel;
+    } else if (scenes.length > 1) {
+      const concatInputs = scenes.map((_, i) => `[${i}:v]`).join('');
+      filters.push(`${concatInputs}concat=n=${scenes.length}:v=1:a=0[vcat]`);
+      videoLabel = 'vcat';
+    }
+    let inputIndex = scenes.length;
+    const audioLabels = [];
+    let elapsed = 0;
+    for (let i = 0; i < scenes.length; i++) {
+      const scene = scenes[i];
+      if (i > 0) elapsed += durations[i - 1] - (useXfade ? transition : 0);
+      const audio = assetById(scene.audio_asset_id);
+      if (audio) {
+        inputs.push('-i', path.join(MEDIA_DIR, audio.storage_path));
+        const label = `a${i}`;
+        filters.push(`[${inputIndex}:a]adelay=${Math.round(elapsed * 1000)}:all=1,apad[${label}]`);
+        audioLabels.push(`[${label}]`);
+        inputIndex++;
+      }
+    }
+    if (project.music_asset_id) {
+      const music = assetById(project.music_asset_id);
+      if (music) {
+        inputs.push('-stream_loop', '-1', '-i', path.join(MEDIA_DIR, music.storage_path));
+        const fadeStart = Math.max(0, totalDuration - 3);
+        filters.push(`[${inputIndex}:a]volume=${Number(project.music_volume) || 0.28},afade=t=out:st=${fadeStart}:d=3,apad[amusic]`);
+        audioLabels.push('[amusic]');
+        inputIndex++;
+      }
+    }
+    let audioLabel = null;
+    if (audioLabels.length === 1) {
+      audioLabel = audioLabels[0].slice(1, -1);
+    } else if (audioLabels.length > 1) {
+      filters.push(`${audioLabels.join('')}amix=inputs=${audioLabels.length}:normalize=0[aout]`);
+      audioLabel = 'aout';
+    } else {
+      inputs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
+      audioLabel = `${inputIndex}:a`;
+      inputIndex++;
+    }
+    const outputTmp = path.join(tmpDir, 'final.mp4');
+    const args = ['-y', ...inputs];
+    if (filters.length) args.push('-filter_complex', filters.join(';'));
+    const videoMap = scenes.length > 1 ? `[${videoLabel}]` : '0:v';
+    const audioMap = audioLabel.includes(':') ? audioLabel : `[${audioLabel}]`;
+    args.push('-map', videoMap, '-map', audioMap,
+      '-t', String(totalDuration), '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', outputTmp);
+    await runFfmpeg(args);
+    const storageRelative = path.join(String(project.owner_id), String(project.id), `final_video-${crypto.randomUUID()}.mp4`);
+    const storageAbsolute = path.join(MEDIA_DIR, storageRelative);
+    fs.mkdirSync(path.dirname(storageAbsolute), { recursive: true });
+    fs.copyFileSync(outputTmp, storageAbsolute);
+    const data = fs.readFileSync(storageAbsolute);
+    const timestamp = now();
+    const info = db.prepare(`
+      INSERT INTO assets (owner_id, project_id, scene_id, kind, original_name, storage_path, mime_type, size_bytes, sha256, created_at)
+      VALUES (?, ?, NULL, 'final_video', ?, ?, 'video/mp4', ?, ?, ?)
+    `).run(project.owner_id, project.id, `${project.title} — video hoàn chỉnh.mp4`, storageRelative, data.length,
+      crypto.createHash('sha256').update(data).digest('hex'), timestamp);
+    const finalAssetId = Number(info.lastInsertRowid);
+    db.prepare('UPDATE projects SET final_asset_id = ?, status = ?, updated_at = ? WHERE id = ?').run(finalAssetId, 'completed', timestamp, project.id);
+    setJob('done', { finalAssetId, durationSec: totalDuration, message: 'Ghép hoàn tất bằng worker FFmpeg nội bộ.' }, null);
+  } catch (error) {
+    setJob('failed', null, String(error.message || error).slice(0, 800));
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function parseMultipart(buffer, boundary) {
   const delimiter = Buffer.from(`--${boundary}`);
   const fields = {};
@@ -413,6 +602,50 @@ async function handleApi(req, res, url) {
     const csrf = createSession(req, res, user);
     audit(user.id, 'login', 'user', user.id, {});
     return json(res, 200, { ok: true, user: publicUser(user), csrf });
+  }
+
+  // Worker/provider callbacks (token-authenticated, no user session).
+  if (parts[1] === 'worker' && method === 'POST') {
+    const expected = process.env.WORKER_TOKEN || '';
+    if (!expected) return fail(res, 503, 'WORKER_TOKEN chưa được cấu hình trên máy chủ.');
+    if (req.headers['x-worker-token'] !== expected) return fail(res, 401, 'Worker token không hợp lệ.');
+    const jobId = Number(parts[3]);
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId);
+    if (!job || parts[2] !== 'jobs') return fail(res, 404, 'Không tìm thấy tác vụ.');
+    const body = await readJson(req);
+    if (parts[4] === 'fail') {
+      db.prepare('UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?')
+        .run('failed', cleanText(body.error || 'Worker báo lỗi.', 800), now(), jobId);
+      return json(res, 200, { ok: true });
+    }
+    if (parts[4] === 'complete') {
+      const project = getProjectRow(job.project_id);
+      for (const item of Array.isArray(body.scenes) ? body.scenes : []) {
+        const scene = getScene(Number(item.sceneId));
+        const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(Number(item.assetId));
+        if (!scene || !asset || scene.project_id !== job.project_id || asset.project_id !== job.project_id) continue;
+        if (job.kind === 'voiceover') {
+          db.prepare('UPDATE scenes SET audio_asset_id = ?, audio_voice_id = ?, voice_sync_status = ?, updated_at = ? WHERE id = ?')
+            .run(asset.id, project.voice_id, 'synced', now(), scene.id);
+        } else if (job.kind === 'reference') {
+          db.prepare('UPDATE scenes SET ref_asset_id = ?, ref_exact = 0, updated_at = ? WHERE id = ?').run(asset.id, now(), scene.id);
+        } else {
+          db.prepare('UPDATE scenes SET video_asset_id = ?, review_status = ?, reviewed_at = NULL, updated_at = ? WHERE id = ?')
+            .run(asset.id, 'pending', now(), scene.id);
+        }
+      }
+      if (body.finalAssetId) {
+        const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(Number(body.finalAssetId));
+        if (asset && asset.project_id === job.project_id) {
+          db.prepare('UPDATE projects SET final_asset_id = ?, status = ?, updated_at = ? WHERE id = ?')
+            .run(asset.id, 'completed', now(), job.project_id);
+        }
+      }
+      db.prepare('UPDATE jobs SET status = ?, result_json = ?, error = NULL, updated_at = ? WHERE id = ?')
+        .run('done', JSON.stringify(body.result || { message: 'Worker đã giao kết quả.' }), now(), jobId);
+      return json(res, 200, { ok: true });
+    }
+    return fail(res, 404, 'Không tìm thấy callback.');
   }
 
   const auth = requireAuth(req, res);
@@ -580,13 +813,24 @@ async function handleApi(req, res, url) {
           WHERE project_id = ?
         `).run(now(), projectId);
       }
+      let musicAssetId = project.music_asset_id;
+      if (body.musicAssetId !== undefined) {
+        if (body.musicAssetId === null) musicAssetId = null;
+        else {
+          const music = db.prepare('SELECT * FROM assets WHERE id = ?').get(Number(body.musicAssetId));
+          if (!music || music.kind !== 'music' || music.owner_id !== project.owner_id) {
+            return fail(res, 400, 'Nhạc nền không thuộc kho của chủ dự án.');
+          }
+          musicAssetId = music.id;
+        }
+      }
       db.prepare(`
         UPDATE projects SET title = ?, source_mode = ?, format = ?, target_duration_sec = ?, style = ?, camera_style = ?,
           voice_id = ?, voice_label = ?, voice_engine_id = ?, fidelity_mode = ?, music_enabled = ?, music_volume = ?,
-          transition_sec = ?, status = ?, updated_at = ? WHERE id = ?
+          transition_sec = ?, status = ?, music_asset_id = ?, updated_at = ? WHERE id = ?
       `).run(updates.title, updates.source_mode, updates.format, updates.target_duration_sec, updates.style, updates.camera_style,
         voice.id, voice.label, voice.engineId, updates.fidelity_mode, updates.music_enabled, updates.music_volume,
-        updates.transition_sec, updates.status, now(), projectId);
+        updates.transition_sec, updates.status, musicAssetId, now(), projectId);
       audit(auth.user.id, 'update_project', 'project', projectId, { voiceChanged: voice.id !== project.voice_id });
       return json(res, 200, { ok: true, project: projectRow(getProjectRow(projectId)) });
     }
@@ -624,13 +868,20 @@ async function handleApi(req, res, url) {
         if (blockers.length) return fail(res, 400, `Chưa thể ghép. ${blockers.join('; ')}`);
       }
       const timestamp = now();
+      const isStitch = kind === 'stitch';
+      const initialStatus = isStitch ? 'queued' : 'waiting_provider';
+      const initialResult = isStitch
+        ? { message: 'Đã vào hàng đợi ghép. Worker FFmpeg nội bộ sẽ xử lý từ các clip có sẵn.' }
+        : { message: 'Đã vào hàng đợi. Cần cấu hình nhà cung cấp xử lý bên ngoài trước khi tác vụ chạy thật.' };
       const info = db.prepare(`
         INSERT INTO jobs (owner_id, project_id, kind, scope, status, payload_json, result_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'waiting_provider', ?, ?, ?, ?)
-      `).run(auth.user.id, projectId, kind, cleanText(body.scope || '', 200), JSON.stringify(body.payload || {}),
-        JSON.stringify({ message: 'Đã vào hàng đợi. Cần cấu hình nhà cung cấp xử lý bên ngoài trước khi tác vụ chạy thật.' }), timestamp, timestamp);
-      audit(auth.user.id, 'create_job', 'job', Number(info.lastInsertRowid), { kind, projectId });
-      return json(res, 201, { ok: true, job: db.prepare('SELECT * FROM jobs WHERE id = ?').get(info.lastInsertRowid) });
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(auth.user.id, projectId, kind, cleanText(body.scope || '', 200), initialStatus, JSON.stringify(body.payload || {}),
+        JSON.stringify(initialResult), timestamp, timestamp);
+      const jobId = Number(info.lastInsertRowid);
+      audit(auth.user.id, 'create_job', 'job', jobId, { kind, projectId });
+      if (isStitch) setImmediate(() => { processStitchJob(jobId).catch((error) => console.error('Stitch job failed', jobId, error)); });
+      return json(res, 201, { ok: true, job: db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) });
     }
   }
 
@@ -778,6 +1029,168 @@ async function handleApi(req, res, url) {
     res.writeHead(200, { ...headers, 'Content-Length': stat.size });
     fs.createReadStream(absolute).pipe(res);
     return;
+  }
+
+  if (method === 'POST' && url.pathname === '/api/projects/parse-storyboard') {
+    if (!requireWrite(res, auth)) return;
+    const body = await readJson(req);
+    const title = cleanText(body.title, 250);
+    const storyboardText = String(body.storyboardText || '');
+    if (!title || !storyboardText.trim()) return fail(res, 400, 'Cần nhập tên dự án và nội dung kịch bản phân cảnh.');
+    const parsed = parseStoryboard(storyboardText);
+    if (!parsed.length) return fail(res, 400, 'Không tách được phân cảnh nào từ kịch bản.');
+    const voiceId = VOICES[body.voiceId] ? body.voiceId : 'lily';
+    const timestamp = now();
+    const total = parsed.reduce((sum, scene) => sum + scene.durationSec, 0);
+    const info = db.prepare(`
+      INSERT INTO projects (owner_id, title, source_mode, format, target_duration_sec, style, camera_style,
+        voice_id, voice_label, voice_engine_id, fidelity_mode, music_enabled, music_volume, transition_sec, status, created_at, updated_at)
+      VALUES (?, ?, 'storyboard', ?, ?, ?, 'auto', ?, ?, ?, 'strict100', 1, 0.28, 0.5, 'draft', ?, ?)
+    `).run(auth.user.id, title, PROJECT_FORMATS.has(body.format) ? body.format : '16:9', Math.round(total),
+      cleanText(body.style || 'commercial', 80), voiceId, VOICES[voiceId].label, VOICES[voiceId].engineId, timestamp, timestamp);
+    const projectId = Number(info.lastInsertRowid);
+    const insert = db.prepare(`
+      INSERT INTO scenes (project_id, position, title, duration_sec, prompt, ref_prompt, voiceover, overlay, camera_move, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, '', ?, ?, 'auto', ?, ?)
+    `);
+    parsed.forEach((scene, index) => insert.run(projectId, index, scene.title, scene.durationSec, scene.prompt, scene.voiceover, scene.overlay, timestamp, timestamp));
+    audit(auth.user.id, 'parse_storyboard', 'project', projectId, { scenes: parsed.length });
+    return json(res, 201, { ok: true, project: projectRow(getProjectRow(projectId)), sceneCount: parsed.length });
+  }
+
+  if (method === 'DELETE' && parts[1] === 'projects' && parts[2] && parts.length === 3) {
+    const projectId = Number(parts[2]);
+    const project = getAccessibleProject(req, res, auth, projectId, true);
+    if (!project) return;
+    const assets = db.prepare('SELECT storage_path FROM assets WHERE project_id = ?').all(projectId);
+    db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
+    for (const asset of assets) {
+      try { fs.rmSync(path.join(MEDIA_DIR, asset.storage_path), { force: true }); } catch {}
+    }
+    audit(auth.user.id, 'delete_project', 'project', projectId, { title: project.title });
+    return json(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && parts[1] === 'projects' && parts[2] && parts[3] === 'move-scene') {
+    const projectId = Number(parts[2]);
+    const project = getAccessibleProject(req, res, auth, projectId, true);
+    if (!project) return;
+    const body = await readJson(req);
+    const scenes = db.prepare('SELECT * FROM scenes WHERE project_id = ? ORDER BY position ASC, id ASC').all(projectId);
+    const index = scenes.findIndex((scene) => scene.id === Number(body.sceneId));
+    const target = body.direction === 'up' ? index - 1 : index + 1;
+    if (index === -1 || target < 0 || target >= scenes.length) return fail(res, 400, 'Không thể di chuyển cảnh theo hướng đó.');
+    const a = scenes[index];
+    const b = scenes[target];
+    db.prepare('UPDATE scenes SET position = ? WHERE id = ?').run(b.position, a.id);
+    db.prepare('UPDATE scenes SET position = ? WHERE id = ?').run(a.position, b.id);
+    return json(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && parts[1] === 'projects' && parts[2] && parts[3] === 'scale-durations') {
+    const projectId = Number(parts[2]);
+    const project = getAccessibleProject(req, res, auth, projectId, true);
+    if (!project) return;
+    const body = await readJson(req);
+    const target = clampNumber(body.targetDurationSec, 5, 600, project.target_duration_sec);
+    const scenes = db.prepare('SELECT * FROM scenes WHERE project_id = ? ORDER BY position ASC, id ASC').all(projectId);
+    if (!scenes.length) return fail(res, 400, 'Dự án chưa có phân cảnh.');
+    const total = scenes.reduce((sum, scene) => sum + Number(scene.duration_sec), 0) || scenes.length;
+    const scaled = scenes.map((scene) => Math.max(1, Math.round((Number(scene.duration_sec) / total) * target * 2) / 2));
+    let diff = Math.round((target - scaled.reduce((a, b) => a + b, 0)) * 2) / 2;
+    if (diff !== 0) {
+      const largest = scaled.indexOf(Math.max(...scaled));
+      scaled[largest] = Math.max(1, scaled[largest] + diff);
+    }
+    scenes.forEach((scene, i) => db.prepare('UPDATE scenes SET duration_sec = ?, updated_at = ? WHERE id = ?').run(scaled[i], now(), scene.id));
+    db.prepare('UPDATE projects SET target_duration_sec = ?, updated_at = ? WHERE id = ?').run(Math.round(target), now(), projectId);
+    return json(res, 200, { ok: true, durations: scaled });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/music-assets') {
+    const rows = auth.user.role === 'admin'
+      ? db.prepare('SELECT * FROM assets WHERE kind = ? ORDER BY created_at DESC').all('music')
+      : db.prepare('SELECT * FROM assets WHERE kind = ? AND owner_id = ? ORDER BY created_at DESC').all('music', auth.user.id);
+    return json(res, 200, { ok: true, musicAssets: rows });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/music-assets/upload') {
+    if (!requireWrite(res, auth)) return;
+    const contentType = String(req.headers['content-type'] || '');
+    const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/);
+    if (!contentType.startsWith('multipart/form-data') || !boundaryMatch) return fail(res, 400, 'Hãy gửi file bằng multipart/form-data.');
+    const raw = await readRaw(req, MAX_UPLOAD_BYTES);
+    const parsed = parseMultipart(raw, boundaryMatch[1] || boundaryMatch[2]);
+    const file = parsed.files.find((item) => item.field === 'file') || parsed.files[0];
+    if (!file || !file.data.length) return fail(res, 400, 'Chưa nhận được file nhạc.');
+    const safeExt = path.extname(file.filename).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 12) || '.bin';
+    const storageRelative = path.join(String(auth.user.id), 'music', `music-${crypto.randomUUID()}${safeExt}`);
+    const storageAbsolute = path.join(MEDIA_DIR, storageRelative);
+    fs.mkdirSync(path.dirname(storageAbsolute), { recursive: true });
+    fs.writeFileSync(storageAbsolute, file.data);
+    const info = db.prepare(`
+      INSERT INTO assets (owner_id, project_id, scene_id, kind, original_name, storage_path, mime_type, size_bytes, sha256, created_at)
+      VALUES (?, NULL, NULL, 'music', ?, ?, ?, ?, ?, ?)
+    `).run(auth.user.id, cleanText(parsed.fields.name || file.filename, 250), storageRelative, file.mimeType, file.data.length,
+      crypto.createHash('sha256').update(file.data).digest('hex'), now());
+    return json(res, 201, { ok: true, asset: db.prepare('SELECT * FROM assets WHERE id = ?').get(info.lastInsertRowid) });
+  }
+
+  if (method === 'DELETE' && parts[1] === 'music-assets' && parts[2]) {
+    const asset = db.prepare('SELECT * FROM assets WHERE id = ?').get(Number(parts[2]));
+    if (!asset || asset.kind !== 'music' || (auth.user.role !== 'admin' && asset.owner_id !== auth.user.id)) {
+      return fail(res, 404, 'Không tìm thấy bản nhạc.');
+    }
+    db.prepare('UPDATE projects SET music_asset_id = NULL WHERE music_asset_id = ?').run(asset.id);
+    db.prepare('DELETE FROM assets WHERE id = ?').run(asset.id);
+    try { fs.rmSync(path.join(MEDIA_DIR, asset.storage_path), { force: true }); } catch {}
+    return json(res, 200, { ok: true });
+  }
+
+  if (method === 'POST' && parts[1] === 'scenes' && parts[2] && parts[3] === 'reference') {
+    const scene = getScene(Number(parts[2]));
+    if (!scene) return fail(res, 404, 'Không tìm thấy phân cảnh.');
+    const project = getAccessibleProject(req, res, auth, scene.project_id, true);
+    if (!project) return;
+    const body = await readJson(req);
+    const mode = ['exact', 'ai', 'fix'].includes(body.mode) ? body.mode : 'ai';
+    if (mode === 'exact') {
+      if (!project.source_asset_id) return fail(res, 400, 'Dự án chưa có ảnh gốc để dùng làm tham chiếu 100%.');
+      const source = db.prepare('SELECT * FROM assets WHERE id = ?').get(project.source_asset_id);
+      if (!source) return fail(res, 400, 'Không tìm thấy file ảnh gốc.');
+      const safeExt = path.extname(source.original_name).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 12) || '.jpg';
+      const storageRelative = path.join(String(project.owner_id), String(project.id), `ref_image-${crypto.randomUUID()}${safeExt}`);
+      const storageAbsolute = path.join(MEDIA_DIR, storageRelative);
+      fs.mkdirSync(path.dirname(storageAbsolute), { recursive: true });
+      fs.copyFileSync(path.join(MEDIA_DIR, source.storage_path), storageAbsolute);
+      const data = fs.readFileSync(storageAbsolute);
+      const info = db.prepare(`
+        INSERT INTO assets (owner_id, project_id, scene_id, kind, original_name, storage_path, mime_type, size_bytes, sha256, created_at)
+        VALUES (?, ?, ?, 'ref_image', ?, ?, ?, ?, ?, ?)
+      `).run(project.owner_id, project.id, scene.id, source.original_name, storageRelative, source.mime_type, data.length,
+        crypto.createHash('sha256').update(data).digest('hex'), now());
+      const assetId = Number(info.lastInsertRowid);
+      db.prepare('UPDATE scenes SET ref_asset_id = ?, ref_exact = 1, updated_at = ? WHERE id = ?').run(assetId, now(), scene.id);
+      return json(res, 201, { ok: true, asset: db.prepare('SELECT * FROM assets WHERE id = ?').get(assetId), exact: true });
+    }
+    const instructions = mode === 'fix'
+      ? 'Regenerate this scene reference from the original photo context: the product cap must be completely plain (no engraved text, no embossed or debossed logo) and every label line must be copied verbatim from the original photo — none added, none removed, none re-typeset.'
+      : `Generate this scene still locked to the project master prompt and the source photo: the product must remain an exact replica — same packaging, same colors, same label text letter-for-letter; never redesign or re-typeset the label. Master prompt: ${project.master_prompt || project.title}`;
+    const timestamp = now();
+    const info = db.prepare(`
+      INSERT INTO jobs (owner_id, project_id, kind, scope, status, payload_json, result_json, created_at, updated_at)
+      VALUES (?, ?, 'reference', ?, 'waiting_provider', ?, ?, ?, ?)
+    `).run(auth.user.id, project.id, `scene:${scene.id}`, JSON.stringify({ mode, instructions }),
+      JSON.stringify({ message: 'Đã vào hàng đợi tạo ảnh tham chiếu. Cần cấu hình nhà cung cấp ảnh bên ngoài.' }), timestamp, timestamp);
+    return json(res, 201, { ok: true, job: db.prepare('SELECT * FROM jobs WHERE id = ?').get(info.lastInsertRowid) });
+  }
+
+  if (method === 'GET' && parts[1] === 'jobs' && parts[2]) {
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(Number(parts[2]));
+    if (!job) return fail(res, 404, 'Không tìm thấy tác vụ.');
+    const project = getProjectRow(job.project_id);
+    if (!canReadProject(auth.user, project)) return fail(res, 404, 'Không tìm thấy tác vụ.');
+    return json(res, 200, { ok: true, job });
   }
 
   return fail(res, 404, 'Không tìm thấy API.');

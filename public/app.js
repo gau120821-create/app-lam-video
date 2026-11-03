@@ -46,6 +46,17 @@ async function api(path, options = {}) {
   return payload;
 }
 
+const CAMERA_MOVES = [
+  ['auto', 'Tự động'], ['dolly-in', 'Dolly tiến cận'], ['dolly-out', 'Dolly lùi mở khung'],
+  ['orbit', 'Orbit quay quanh sản phẩm'], ['tracking', 'Tracking bám theo'], ['crane', 'Crane nâng/hạ'],
+  ['gimbal', 'Gimbal mượt mà'], ['macro', 'Macro cận cảnh'], ['slow-motion', 'Slow-motion']
+];
+
+function cameraSelect(name, selected, disabled) {
+  return `<select name="${name}" ${disabled ? 'disabled' : ''}>${CAMERA_MOVES.map(([value, label]) =>
+    `<option value="${value}" ${selected === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
+}
+
 function roleLabel(role) {
   return { admin: 'Quản trị viên', staff: 'Nhân viên biên tập', viewer: 'Chỉ xem' }[role] || role;
 }
@@ -225,9 +236,32 @@ async function renderProjects() {
         <button class="btn primary" type="submit">Tạo dự án</button>
       </form>
     </section>` : ''}
+    ${canWrite() ? `
+    <section class="card section">
+      <h2>Tạo dự án từ kịch bản phân cảnh</h2>
+      <p class="muted">Dán kịch bản có đánh dấu từng cảnh (ví dụ “Cảnh 1:”, “Cảnh 2:”), ghi thời lượng dạng “8s” hoặc “8 giây”, dòng “Lời thoại: …” và “Chữ: …” nếu có. Hệ thống sẽ tách thành các phân cảnh để bạn kiểm tra lại.</p>
+      <form id="storyboard-form" class="form">
+        <div class="form-grid">
+          <label>Tên dự án<input name="title" required placeholder="Ví dụ: TVC từ kịch bản có sẵn"></label>
+          <label>Khung hình<select name="format"><option>16:9</option><option>9:16</option><option>1:1</option></select></label>
+          <label>Giọng thống nhất<select name="voiceId"><option value="lily">Lily (Mellow Saxophone)</option><option value="aria">Aria</option></select></label>
+        </div>
+        <label>Nội dung kịch bản<textarea name="storyboardText" required style="min-height:150px" placeholder="Cảnh 1 (6s): ...&#10;Lời thoại: ...&#10;Chữ: ..."></textarea></label>
+        <button class="btn primary" type="submit">Tách kịch bản thành dự án</button>
+      </form>
+    </section>` : ''}
     <section class="grid cards">${projects.map(projectCard).join('') || '<div class="card muted">Chưa có dự án nào.</div>'}</section>`);
   bindShell();
   bindProjectCards();
+  const storyboardForm = document.getElementById('storyboard-form');
+  if (storyboardForm) storyboardForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      const payload = await api('/api/projects/parse-storyboard', { method: 'POST', body: Object.fromEntries(new FormData(event.currentTarget).entries()) });
+      toast(`Đã tách kịch bản thành ${payload.sceneCount} phân cảnh.`);
+      await openProject(payload.project.id);
+    } catch (error) { toast(error.message, true); }
+  });
   const form = document.getElementById('project-form');
   if (form) form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -275,7 +309,7 @@ function sceneCard(project, scene, index) {
   <article class="card scene-card" id="scene-${scene.id}">
     <div class="scene-head">
       <div><div class="eyebrow">Cảnh ${index + 1}</div><h3>${esc(scene.title)}</h3>
-      <div class="row">${reviewStatus(scene)} ${voiceStatus(scene)} <span class="chip">${scene.duration_sec} giây</span></div></div>
+      <div class="row">${reviewStatus(scene)} ${voiceStatus(scene)} <span class="chip">${scene.duration_sec} giây</span>${scene.ref_exact ? '<span class="chip good">Ảnh tham chiếu giống 100%</span>' : ''}</div></div>
       ${editable ? `<button class="btn danger small" data-delete-scene="${scene.id}">Xóa cảnh</button>` : ''}
     </div>
     <div class="media-grid">
@@ -298,7 +332,7 @@ function sceneCard(project, scene, index) {
     <form data-scene-form="${scene.id}" class="form-grid">
       <label>Tên cảnh<input name="title" value="${esc(scene.title)}" ${editable ? '' : 'disabled'}></label>
       <label>Thời lượng (giây)<input name="durationSec" type="number" min="1" max="120" step="0.5" value="${esc(scene.duration_sec)}" ${editable ? '' : 'disabled'}></label>
-      <label>Chuyển động máy quay<input name="cameraMove" value="${esc(scene.camera_move)}" ${editable ? '' : 'disabled'}></label>
+      <label>Chuyển động máy quay${cameraSelect('cameraMove', scene.camera_move, !editable)}</label>
       <label>Chữ đồ họa / overlay<input name="overlay" value="${esc(scene.overlay)}" ${editable ? '' : 'disabled'}></label>
       <label style="grid-column:1/-1">Mô tả hình ảnh / prompt video<textarea name="prompt" ${editable ? '' : 'disabled'}>${esc(scene.prompt)}</textarea></label>
       <label style="grid-column:1/-1">Prompt ảnh tham chiếu<textarea name="refPrompt" ${editable ? '' : 'disabled'}>${esc(scene.ref_prompt)}</textarea></label>
@@ -311,6 +345,13 @@ function sceneCard(project, scene, index) {
       <button class="btn danger" data-review="needs_fix" data-scene="${scene.id}">Chưa đạt — cần sửa</button>
       <button class="btn" data-review="pending" data-scene="${scene.id}">Đặt lại chưa duyệt</button>
       <button class="btn" data-job="revise" data-scene="${scene.id}">Gửi yêu cầu tạo lại clip</button>
+    </div>
+    <div class="row">
+      <button class="btn small" data-move="up" data-scene="${scene.id}">↑ Lên</button>
+      <button class="btn small" data-move="down" data-scene="${scene.id}">↓ Xuống</button>
+      <button class="btn small" data-ref-mode="exact" data-scene="${scene.id}">Dùng ảnh gốc làm tham chiếu — giống 100%</button>
+      <button class="btn small" data-ref-mode="ai" data-scene="${scene.id}">Tạo ảnh tham chiếu AI</button>
+      <button class="btn small" data-ref-mode="fix" data-scene="${scene.id}">Sửa nắp & nhãn</button>
     </div>` : ''}
   </article>`;
 }
@@ -318,6 +359,10 @@ function sceneCard(project, scene, index) {
 async function openProject(projectId) {
   state.view = 'project';
   const payload = await api(`/api/projects/${projectId}`);
+  try {
+    const musicPayload = await api('/api/music-assets');
+    payload.musicAssets = musicPayload.musicAssets;
+  } catch { payload.musicAssets = []; }
   state.detail = payload;
   const project = payload.project;
   const editable = canWrite() && project.owner_id === state.user.id;
@@ -331,6 +376,7 @@ async function openProject(projectId) {
       <h1>${esc(project.title)}</h1>
       <p class="muted">${project.sceneCount} cảnh · ${project.approvedSceneCount}/${project.sceneCount} cảnh đã duyệt · Giọng thống nhất: ${esc(project.voice_label)}</p></div>
       <span class="chip ${project.hasFinalVideo ? 'good' : 'warn'}">${project.hasFinalVideo ? 'Đã có video hoàn chỉnh' : 'Chưa có video đã ghép'}</span>
+      ${editable ? '<button class="btn danger" id="delete-project">Xóa dự án</button>' : ''}
     </div>
     ${!editable ? '<div class="progress-note">Bạn đang xem dự án ở chế độ chỉ đọc. Chỉ chủ kho mới sửa được dự án của mình; quản trị viên vẫn xem và tải được toàn bộ.</div>' : ''}
 
@@ -350,7 +396,7 @@ async function openProject(projectId) {
         <label>Khung hình<select name="format" ${editable ? '' : 'disabled'}>${['16:9','9:16','1:1'].map((v) => `<option ${project.format === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
         <label>Thời lượng mục tiêu (giây)<input name="targetDurationSec" type="number" min="5" max="600" value="${project.target_duration_sec}" ${editable ? '' : 'disabled'}></label>
         <label>Phong cách<input name="style" value="${esc(project.style)}" ${editable ? '' : 'disabled'}></label>
-        <label>Chuyển động máy quay mặc định<input name="cameraStyle" value="${esc(project.camera_style)}" ${editable ? '' : 'disabled'}></label>
+        <label>Chuyển động máy quay mặc định${cameraSelect('cameraStyle', project.camera_style, !editable)}</label>
         <label>Một giọng cho toàn dự án
           <select name="voiceId" ${editable ? '' : 'disabled'}>
             <option value="lily" ${project.voice_id === 'lily' ? 'selected' : ''}>Lily (Mellow Saxophone)</option>
@@ -359,9 +405,27 @@ async function openProject(projectId) {
         </label>
         <label>Chuyển cảnh (giây)<input name="transitionSec" type="number" min="0" max="3" step="0.1" value="${project.transition_sec}" ${editable ? '' : 'disabled'}></label>
         <label>Âm lượng nhạc (0–1)<input name="musicVolume" type="number" min="0" max="1" step="0.01" value="${project.music_volume}" ${editable ? '' : 'disabled'}></label>
+        <label>Nhạc nền của dự án
+          <select name="musicAssetId" ${editable ? '' : 'disabled'}>
+            <option value="">Chưa chọn nhạc</option>
+            ${(payload.musicAssets || []).filter((a) => a.owner_id === project.owner_id).map((a) => `<option value="${a.id}" ${project.music_asset_id === a.id ? 'selected' : ''}>${esc(a.original_name)}</option>`).join('')}
+          </select>
+        </label>
         ${editable ? '<button class="btn primary" type="submit">Lưu cài đặt</button>' : ''}
       </form>
       <p class="muted">Đổi giọng của dự án sẽ đánh dấu mọi bản thu cũ là lệch giọng. Sửa lời thoại một cảnh sẽ hủy bản thu cũ của cảnh đó.</p>
+      ${editable ? `<form id="scale-form" class="row" style="margin-top:.8rem">
+        <label style="min-width:220px">Đổi tổng thời lượng dự án (giây)<input name="target" type="number" min="5" max="600" value="${project.target_duration_sec}"></label>
+        <button class="btn" type="submit">Co giãn mọi cảnh theo tổng mới</button>
+      </form>` : ''}
+    </section>
+
+    <section class="card section">
+      <h2>Thư viện nhạc nền</h2>
+      ${(payload.musicAssets || []).filter((a) => a.owner_id === project.owner_id).map((a) => `
+        <div class="row between"><span>${esc(a.original_name)} <span class="muted">(${formatBytes(a.size_bytes)})</span></span>
+        ${editable ? `<button class="btn danger small" data-delete-music="${a.id}">Xóa nhạc</button>` : ''}</div>`).join('') || '<p class="muted">Chưa có bản nhạc nào trong kho của chủ dự án.</p>'}
+      ${editable ? `<form id="music-upload" class="row" style="margin-top:.7rem"><input class="file-input" type="file" name="file" accept="audio/*" required><button class="btn" type="submit">Tải nhạc nền lên</button></form>` : ''}
     </section>
 
     <section class="card section">
@@ -382,7 +446,7 @@ async function openProject(projectId) {
       <form id="scene-add" class="form-grid">
         <label>Tên cảnh<input name="title" required placeholder="Ví dụ: Hook mở đầu"></label>
         <label>Thời lượng (giây)<input name="durationSec" type="number" min="1" max="120" value="5"></label>
-        <label>Chuyển động máy quay<input name="cameraMove" value="auto"></label>
+        <label>Chuyển động máy quay${cameraSelect('cameraMove', 'auto', false)}</label>
         <label style="grid-column:1/-1">Mô tả hình ảnh<textarea name="prompt"></textarea></label>
         <label style="grid-column:1/-1">Nội dung giọng đọc<textarea name="voiceover"></textarea></label>
         <button class="btn primary" type="submit">Thêm cảnh</button>
@@ -406,6 +470,63 @@ async function openProject(projectId) {
   bindShell();
   document.getElementById('back-projects').addEventListener('click', () => showShell('projects'));
   bindProjectDetail(project);
+  bindProjectExtras(project);
+}
+
+function bindProjectExtras(project) {
+  const editable = canWrite() && project.owner_id === state.user.id;
+  if (!editable) return;
+  const deleteBtn = document.getElementById('delete-project');
+  if (deleteBtn) deleteBtn.addEventListener('click', async () => {
+    if (!confirm('Xóa toàn bộ dự án này cùng các cảnh và file của nó?')) return;
+    try { await api(`/api/projects/${project.id}`, { method: 'DELETE' }); toast('Đã xóa dự án.'); await showShell('projects'); }
+    catch (error) { toast(error.message, true); }
+  });
+  const scaleForm = document.getElementById('scale-form');
+  if (scaleForm) scaleForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const target = Number(new FormData(event.currentTarget).get('target'));
+    try {
+      await api(`/api/projects/${project.id}/scale-durations`, { method: 'POST', body: { targetDurationSec: target } });
+      toast('Đã co giãn thời lượng các cảnh.');
+      await openProject(project.id);
+    } catch (error) { toast(error.message, true); }
+  });
+  const musicUpload = document.getElementById('music-upload');
+  if (musicUpload) musicUpload.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const file = new FormData(event.currentTarget).get('file');
+    const form = new FormData();
+    form.append('file', file);
+    try { await api('/api/music-assets/upload', { method: 'POST', body: form }); toast('Đã tải nhạc nền.'); await openProject(project.id); }
+    catch (error) { toast(error.message, true); }
+  });
+  document.querySelectorAll('[data-delete-music]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (!confirm('Xóa bản nhạc này khỏi thư viện?')) return;
+      try { await api(`/api/music-assets/${button.dataset.deleteMusic}`, { method: 'DELETE' }); await openProject(project.id); }
+      catch (error) { toast(error.message, true); }
+    });
+  });
+  document.querySelectorAll('[data-move]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      try {
+        await api(`/api/projects/${project.id}/move-scene`, { method: 'POST', body: { sceneId: Number(button.dataset.scene), direction: button.dataset.move } });
+        await openProject(project.id);
+      } catch (error) { toast(error.message, true); }
+    });
+  });
+  document.querySelectorAll('[data-ref-mode]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const sceneId = Number(button.dataset.scene);
+      const mode = button.dataset.refMode;
+      try {
+        const payload = await api(`/api/scenes/${sceneId}/reference`, { method: 'POST', body: { mode } });
+        toast(payload.exact ? 'Đã dùng ảnh gốc làm ảnh tham chiếu — giống 100%.' : 'Đã đưa yêu cầu tạo ảnh tham chiếu vào hàng đợi.');
+        await openProject(project.id);
+      } catch (error) { toast(error.message, true); }
+    });
+  });
 }
 
 function bindProjectDetail(project) {
@@ -418,6 +539,7 @@ function bindProjectDetail(project) {
     data.targetDurationSec = Number(data.targetDurationSec);
     data.transitionSec = Number(data.transitionSec);
     data.musicVolume = Number(data.musicVolume);
+    data.musicAssetId = data.musicAssetId ? Number(data.musicAssetId) : null;
     try {
       await api(`/api/projects/${project.id}`, { method: 'PATCH', body: data });
       toast('Đã lưu cài đặt dự án.');
